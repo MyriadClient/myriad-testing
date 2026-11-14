@@ -1,5 +1,5 @@
 build/
 .gradle/
-run*/
+/run*/
 __pycache__/
 *.pyc
