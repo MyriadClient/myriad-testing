@@ -1,0 +1,52 @@
+# Builds a tagged version, attaches the jar (and sources) to a GitHub release, and publishes it to Myriad's maven
+# (https://maven.myriadclient.dev/releases), where the addon plugin's gametest source set takes it from
+# (testing_version). Tag with mod_version from gradle.properties: `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# Publishing uses the MAVEN_USERNAME and MAVEN_PASSWORD secrets: a maven token allowed to write dev/myriadclient.
+
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew
+      - name: check the tag matches gradle.properties
+        run: |
+          version=$(grep '^mod_version=' gradle.properties | cut -d= -f2)
+          [ "v$version" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} but gradle.properties says $version"; exit 1; }
+      - name: build and test
+        run: ./gradlew build
+      - name: release notes from the changelog
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '/^## /{p = ($2 == v)} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Myriad Testing $version" > notes.md
+          # Which Minecraft it's for, from the built jar's fabric.mod.json: Myriad's update check only offers releases for the player's.
+          printf '\nMinecraft: %s\n' "$(unzip -p build/libs/myriad-testing-$version.jar fabric.mod.json | jq -r '.depends.minecraft')" >> notes.md
+      - name: create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: build/libs/*.jar
+      - name: publish to Myriad's maven
+        env:
+          ORG_GRADLE_PROJECT_myriadUsername: ${{ secrets.MAVEN_USERNAME }}
+          ORG_GRADLE_PROJECT_myriadPassword: ${{ secrets.MAVEN_PASSWORD }}
+        run: ./gradlew publishAddon

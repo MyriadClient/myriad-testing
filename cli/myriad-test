@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Runs Myriad's in-game tests in a dev client that has Myriad Testing loaded, and shows why any failed.
+
+  myriad-test list [filter ...]               the tests the client knows
+  myriad-test run [filter ...] [--tag t]      run them; a line per test, and for failures the steps, flags and report
+  myriad-test run ... --reload                rebuild what changed, hot-swap it into the client, then run
+  myriad-test watch [filter ...]              rebuild, hot-swap and rerun the tests whenever a source file is saved
+  myriad-test rerun [--failed]                run the last run's tests again (only the failed ones with --failed)
+  myriad-test report [id-part]                print the last run's report for a failed test (all of it)
+  myriad-test reload                          rebuild what changed and hot-swap it, nothing run
+  myriad-test state                           the game right now: player, inventory, screen, modules on (JSON)
+  myriad-test info                            the client's class folders, debug port and JDK (JSON)
+
+A filter with a "/" that is the end of a test's id ("scaffold/tower") picks just that test; anything else picks every
+test whose id contains it ("scaffold", "tower").
+
+Options: --port N (the client's driver, 25610 by default), --rcon host:port, --rcon-password p, --server-log path
+(the test server's console log, for Grim's flags; defaults to Myriad's Grim test server next to this checkout),
+--dimension id (the worker's), --strict (the server runs current Grim as shipped: ./start.sh --strict), --json (raw
+result lines), --junit file.xml, --no-fresh-session, --answer-clicks off|on|pre (the server answers inventory clicks
+as 2b2t does; off by default), -v.
+
+Hot-swapping needs the client started with -Photswap (the JetBrains Runtime and a debug port), e.g.
+  ./gradlew runTestClient -PcoreDir=../myriad -PtestingDir=../myriad-testing -Photswap
+It rebuilds each project the client runs from a checkout (the addon and its tests, core and Myriad Testing when they
+come from checkouts) and redefines every class changed since the last swap. A new method or field is fine; a new
+setting, a changed default or static initialiser, a mixin change or a new test suite (an entrypoint) needs a restart.
+
+Exit code 0 when everything passed, 1 when something failed, 2 when the client couldn't be reached or a build failed.
+"""
+import argparse, glob, hashlib, json, os, socket, struct, subprocess, sys, time, zipfile
+from xml.sax.saxutils import escape
+
+STATE = os.path.join(os.path.expanduser("~"), ".cache", "myriad-test")
+HERE = os.path.dirname(os.path.abspath(__file__))
+GRIM_LOG = os.path.abspath(os.path.join(HERE, "..", "..", "myriad-essentials", "tools", "grim-test", "server", "console.log"))
+
+
+# ---- the driver -------------------------------------------------------------------------------------------------------
+
+def connect(port):
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except OSError as e:
+        print(f"no Myriad Testing driver on localhost:{port} ({e}): is a dev client with myriad-testing running?", file=sys.stderr)
+        sys.exit(2)
+    s.settimeout(None)
+    return s, s.makefile("r", encoding="utf-8")
+
+
+def request(port, req):
+    s, f = connect(port)
+    s.sendall((json.dumps(req) + "\n").encode())
+    return s, f
+
+
+def ask(port, req):
+    """One request answered with one line."""
+    s, f = request(port, req)
+    try:
+        return json.loads(f.readline())
+    finally:
+        s.close()
+
+
+def config(args):
+    c = {"freshSessionAfterFlags": not args.no_fresh_session}
+    if args.strict: c["strict"] = True
+    if args.answer_clicks: c["answerClicks"] = args.answer_clicks
+    if args.rcon: c["rcon"] = args.rcon
+    if args.rcon_password: c["rconPassword"] = args.rcon_password
+    log = args.server_log or (GRIM_LOG if os.path.exists(GRIM_LOG) else None)
+    if log: c["serverLog"] = log
+    if args.dimension: c["dimension"] = args.dimension
+    return c
+
+
+# ---- running ------------------------------------------------------------------------------------------------------------
+
+def show(r, verbose):
+    mark = "SKIP" if r.get("skipped") else "PASS" if r["ok"] else "FAIL"
+    print(f"{mark}  {r['millis'] / 1000:5.1f}s {r['ticks']:5d}t  {r['id']:<48} {r['detail']}", flush=True)
+    if r["flags"] and (verbose or not r["ok"]):
+        print(f"        flags: {', '.join(r['flags'][:8])}{' ...' if len(r['flags']) > 8 else ''}")
+    if not r["ok"]:
+        for s in r.get("lastSteps", []):
+            print(f"        | {s}")
+        if r.get("report"):
+            print(f"        report: {r['report']}")
+
+
+def run(args, filters):
+    s, f = request(args.port, {"cmd": "run", "filter": filters, "tags": args.tag or [], "config": config(args)})
+    results, started, done = [], time.time(), False
+    for line in f:
+        msg = json.loads(line)
+        if args.json:
+            print(line.rstrip(), flush=True)
+        if msg["type"] == "result":
+            results.append(msg)
+            if not args.json:
+                show(msg, args.verbose)
+        elif msg["type"] == "error":
+            print("error:", msg["message"], file=sys.stderr)
+            return 2
+        elif msg["type"] == "done":
+            done = True
+            break
+    s.close()
+    if not done:
+        # The connection ended without the runner's last line: the client crashed, froze its socket or was closed.
+        after = results[-1]["id"] if results else "the start"
+        print(f"\nthe client went away during the run (after {after}): see its game log, and hs_err_pid*.log in its run "
+              "directory if it crashed", file=sys.stderr)
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "last.json"), "w") as out:
+        json.dump(results, out, indent=1)
+    failed = [r for r in results if not r["ok"]]
+    if not args.json:
+        if not results:
+            print("no tests matched" + (f" {filters}" if filters else ""))
+        else:
+            skipped = sum(1 for r in results if r.get("skipped"))
+            print(f"\n{len(results) - len(failed)}/{len(results)} passed{f' ({skipped} skipped)' if skipped else ''} in {time.time() - started:.0f} s"
+                  + (f"; failed: {', '.join(r['id'] for r in failed)}" if failed else ""))
+    if args.junit:
+        write_junit(args.junit, results)
+    if not done: return 2
+    return 1 if failed or not results else 0
+
+
+def write_junit(path, results):
+    cases = []
+    for r in results:
+        body = "" if r["ok"] else f'<failure message="{escape(r["detail"], {chr(34): "&quot;"})}">{escape(chr(10).join(r.get("lastSteps", [])))}</failure>'
+        cases.append(f'  <testcase classname="{escape(r["id"].split("/")[0])}" name="{escape(r["id"])}" time="{r["millis"] / 1000:.3f}">{body}</testcase>')
+    failures = sum(1 for r in results if not r["ok"])
+    with open(path, "w") as out:
+        out.write(f'<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="myriad" tests="{len(results)}" failures="{failures}">\n'
+                  + "\n".join(cases) + "\n</testsuite>\n")
+
+
+def last():
+    try:
+        with open(os.path.join(STATE, "last.json")) as f:
+            return json.load(f)
+    except OSError:
+        return []
+
+
+# ---- hot reload ---------------------------------------------------------------------------------------------------------
+
+class Jdwp:
+    """Just enough of the Java debug wire protocol to redefine classes."""
+    ERRORS = {60: "invalid class format", 62: "failed verification", 63: "adding a method needs -Photswap",
+              64: "a schema change needs -Photswap", 66: "a hierarchy change needs a restart", 67: "deleting a method needs -Photswap",
+              68: "unsupported class version", 70: "a class modifier change needs a restart", 71: "a method modifier change needs a restart"}
+
+    def __init__(self, port):
+        self.s = socket.create_connection(("localhost", port), timeout=10)
+        self.s.sendall(b"JDWP-Handshake")
+        if self.recv(14) != b"JDWP-Handshake":
+            raise RuntimeError("not a JDWP port")
+        self.id = 0
+        self.ref_size = struct.unpack(">5i", self.call(1, 7))[3]
+
+    def recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.s.recv(n - len(buf))
+            if not chunk: raise ConnectionError("the client closed the debug connection")
+            buf += chunk
+        return buf
+
+    def call(self, cmd_set, cmd, data=b""):
+        self.id += 1
+        self.s.sendall(struct.pack(">iibbb", 11 + len(data), self.id, 0, cmd_set, cmd) + data)
+        while True:
+            length, pid, flags = struct.unpack(">iib", self.recv(9))
+            rest = self.recv(length - 9)
+            # Events (a command packet from the VM) aren't answers: skipped.
+            if not flags & 0x80 or pid != self.id: continue
+            error = struct.unpack(">h", rest[:2])[0]
+            if error: raise RuntimeError(f"JDWP error {error} ({self.ERRORS.get(error, 'see the JDWP spec')})")
+            return rest[2:]
+
+    def loaded(self, name):
+        """The type ids the VM has for the class named like "dev/myriadclient/Foo" (none if it isn't loaded yet)."""
+        sig = f"L{name};".encode()
+        out = self.call(1, 2, struct.pack(">i", len(sig)) + sig)
+        n, out, ids = struct.unpack(">i", out[:4])[0], out[4:], []
+        for _ in range(n):
+            ids.append(out[1:1 + self.ref_size])
+            out = out[1 + self.ref_size + 4:]
+        return ids
+
+    def redefine(self, classes):
+        data = struct.pack(">i", len(classes))
+        for ref, bytecode in classes:
+            data += ref + struct.pack(">i", len(bytecode)) + bytecode
+        self.call(1, 18, data)
+
+    def close(self):
+        self.s.close()
+
+
+# Redefining a few hundred classes at once has crashed the JetBrains Runtime.
+MAX_SWAP = 150
+
+
+def gradle_root(path):
+    """The nearest directory at or above `path` with a Gradle wrapper."""
+    d = path
+    while d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, "gradlew")): return d
+        d = os.path.dirname(d)
+    return None
+
+
+def projects(info):
+    """What the client runs from checkouts: [(gradle root, project dir, {source set: class dir})]."""
+    return [(root, project, {s: d for s, (d, _) in sets.items()}) for root, project, sets in _projects(info)]
+
+
+def jar_of(info):
+    """{class dir: the jar the client loaded those classes from}, for projects it runs as a jar (core, this framework)."""
+    return {d: jar for _, _, sets in _projects(info) for d, jar in sets.values() if jar}
+
+
+def _projects(info):
+    found = {}
+
+    def add(project, source_set, class_dir, jar=None):
+        found.setdefault(project, {})[source_set] = (class_dir, jar)
+
+    for d in info["classDirs"]:
+        marker = os.sep + os.path.join("build", "classes", "java") + os.sep
+        if marker in d:
+            project, source_set = d.split(marker)[0], d.split(marker)[1].split(os.sep)[0]
+            add(project, source_set, d)
+    for jar in info["localJars"]:
+        # A jar built in a checkout (core's, Myriad Testing's): its classes folder next to it is what gets rebuilt.
+        libs = os.path.dirname(jar)
+        if os.path.basename(libs) == "libs" and os.path.basename(os.path.dirname(libs)) == "build":
+            project = os.path.dirname(os.path.dirname(libs))
+            classes = os.path.join(project, "build", "classes", "java", "main")
+            if os.path.isdir(os.path.join(project, "src", "main")): add(project, "main", classes, jar)
+    out = []
+    for project, sets in sorted(found.items()):
+        root = gradle_root(project)
+        if root: out.append((root, project, sets))
+    return out
+
+
+def checkout_props(info):
+    """-PcoreDir and -PtestingDir as the client was built with them, for every build but core's own."""
+    props = {}
+    for jar in info["localJars"]:
+        name = os.path.basename(jar)
+        root = os.path.dirname(os.path.dirname(os.path.dirname(jar)))
+        if name.startswith("myriad-testing-"): props["testingDir"] = root
+        elif name.startswith("myriad-") and os.path.basename(root) == "core": props["coreDir"] = os.path.dirname(root)
+    # This framework from a checkout's class folders (the addon plugin's choice when they're built).
+    for d in info["classDirs"]:
+        marker = os.sep + os.path.join("build", "classes", "java", "main")
+        if d.endswith(marker):
+            project = d[:-len(marker)]
+            try:
+                if '"id": "myriad-testing"' in open(os.path.join(project, "build", "resources", "main", "fabric.mod.json")).read():
+                    props["testingDir"] = project
+            except OSError:
+                pass
+    return props
+
+
+def newest(paths):
+    t = 0
+    for base in paths:
+        for dirpath, dirnames, files in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("build", ".gradle", "run", ".git", "bin")]
+            for f in files:
+                try:
+                    t = max(t, os.path.getmtime(os.path.join(dirpath, f)))
+                except OSError:
+                    pass
+    return t
+
+
+def sources(project):
+    return [os.path.join(project, "src")]
+
+
+def reload(args, info, quiet=False):
+    """Rebuilds the projects with changed sources and hot-swaps every class changed since the last swap. True if fine."""
+    port = info.get("debugPort")
+    if not port:
+        print("the client has no debug port: start it with -Photswap to hot-swap (or restart it to pick up changes)", file=sys.stderr)
+        return False
+    os.makedirs(STATE, exist_ok=True)
+    stamp = os.path.join(STATE, f"reload-{port}-{info['started']}")
+    since = os.path.getmtime(stamp) if os.path.exists(stamp) else info["started"] / 1000
+    started = time.time()
+    props = checkout_props(info)
+    # Before building: the class files the client started with, by hash, as the baseline (a recompile rewrites them all
+    # with the same bytes, and only real changes are swapped in).
+    known_path = stamp + ".json"
+    try:
+        known = json.load(open(known_path))
+    except (OSError, ValueError):
+        known = {}
+        for _, _, sets in projects(info):
+            for class_dir in sets.values():
+                for path in glob.glob(os.path.join(class_dir, "**", "*.class"), recursive=True):
+                    if os.path.getmtime(path) <= info["started"] / 1000:
+                        known[os.path.relpath(path, class_dir)[:-6].replace(os.sep, "/")] = hashlib.sha1(open(path, "rb").read()).hexdigest()
+    env = dict(os.environ, JAVA_HOME=info["javaHome"]) if info.get("javaHome") else os.environ
+    for root, project, sets in projects(info):
+        if newest(sources(project)) <= since: continue
+        prefix = "" if root == project else ":" + os.path.relpath(project, root).replace(os.sep, ":") + ":"
+        tasks = [prefix + ("classes" if s == "main" else s + "Classes") for s in sets]
+        # Relative, as a build next to them is started with (../myriad): another spelling of the same path is another
+        # input to Gradle, and every class would be compiled again.
+        own = [f"-P{k}={os.path.relpath(v, root)}" for k, v in props.items() if root != v and not root.startswith(v + os.sep)]
+        cmd = ["./gradlew", "-q", *tasks, *own]
+        if not quiet: print(f"building {os.path.basename(project)}: {' '.join(tasks)}", flush=True)
+        r = subprocess.run(cmd, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode != 0:
+            lines = [l for l in r.stdout.splitlines() if "warning:" not in l and not l.startswith("Note:")]
+            print("\n".join(lines[-40:]), file=sys.stderr)
+            print(f"build failed in {project}; nothing swapped", file=sys.stderr)
+            return False
+    try:
+        vm = Jdwp(port)
+    except OSError as e:
+        print(f"couldn't reach the client's debug port {port}: {e}", file=sys.stderr)
+        return False
+    # What the client has of each class, by hash: what was swapped in last time, else what the jar it started from holds.
+    # A full recompile rewrites every class file with the same bytes; only real changes are redefined (redefining
+    # hundreds at once has crashed the JetBrains Runtime).
+    jars = {}
+    for class_dir, jar in jar_of(info).items():
+        try:
+            if os.path.getmtime(jar) <= info["started"] / 1000: jars[class_dir] = zipfile.ZipFile(jar)
+        except OSError:
+            pass
+    found, unloaded, same = [], 0, 0
+    seen = {}
+    try:
+        for _, _, sets in projects(info):
+            for class_dir in sets.values():
+                for path in glob.glob(os.path.join(class_dir, "**", "*.class"), recursive=True):
+                    if os.path.getmtime(path) <= since: continue
+                    name = os.path.relpath(path, class_dir)[:-6].replace(os.sep, "/")
+                    # Mixins are applied to the game's classes as those load, never redefined.
+                    if "/mixin/" in name: continue
+                    bytecode = open(path, "rb").read()
+                    digest = hashlib.sha1(bytecode).hexdigest()
+                    had = known.get(name)
+                    if had is None and class_dir in jars:
+                        try:
+                            had = hashlib.sha1(jars[class_dir].read(name + ".class")).hexdigest()
+                        except KeyError:
+                            had = None
+                    seen[name] = digest
+                    if had == digest:
+                        same += 1
+                        continue
+                    refs = vm.loaded(name)
+                    if not refs:
+                        unloaded += 1
+                        # From a jar it loads as the jar has it, not as built: still to swap once it's loaded.
+                        if class_dir in jar_of(info): seen.pop(name)
+                        continue
+                    found += [(ref, bytecode, name) for ref in refs]
+        if len(found) > MAX_SWAP:
+            print(f"{len(found)} classes changed: too many to swap safely (the runtime has crashed on a few hundred); restart the client",
+                  file=sys.stderr)
+            return False
+        if found: vm.redefine([(ref, b) for ref, b, _ in found])
+    except RuntimeError as e:
+        print(f"hot-swap failed, nothing changed: {e}", file=sys.stderr)
+        return False
+    finally:
+        vm.close()
+    known.update(seen)
+    json.dump(known, open(known_path, "w"))
+    open(stamp, "w").close()
+    os.utime(stamp, (started, started))
+    if not quiet or found:
+        names = sorted({n.rsplit("/", 1)[-1] for _, _, n in found})
+        print(f"swapped {len(found)} classes" + (f" ({', '.join(names[:10])}{', ...' if len(names) > 10 else ''})" if names else "")
+              + (f"; {unloaded} not loaded yet (they load as built)" if unloaded else ""), flush=True)
+    return True
+
+
+def watch(args, filters):
+    info = ask(args.port, {"cmd": "info"})
+    watched = [p for _, p, _ in projects(info)]
+    print(f"watching {', '.join(os.path.basename(p) for p in watched)}; Ctrl-C to stop", flush=True)
+    seen = newest(sum((sources(p) for p in watched), []))
+    run(args, filters)
+    try:
+        while True:
+            time.sleep(0.7)
+            now = newest(sum((sources(p) for p in watched), []))
+            if now <= seen: continue
+            # Saves often come in bursts (format on save, several files).
+            time.sleep(0.5)
+            seen = newest(sum((sources(p) for p in watched), []))
+            print(f"\n--- {time.strftime('%H:%M:%S')} change seen", flush=True)
+            if reload(args, info, quiet=True): run(args, filters)
+    except KeyboardInterrupt:
+        return 0
+
+
+# ---- main ---------------------------------------------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("command", choices=["list", "run", "watch", "rerun", "report", "reload", "state", "info"])
+    p.add_argument("filters", nargs="*")
+    p.add_argument("--port", type=int, default=int(os.environ.get("MYRIAD_TEST_PORT", "25610")))
+    p.add_argument("--tag", action="append")
+    p.add_argument("--failed", action="store_true")
+    p.add_argument("--reload", "-r", action="store_true")
+    p.add_argument("--rcon")
+    p.add_argument("--rcon-password")
+    p.add_argument("--server-log")
+    p.add_argument("--dimension")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--junit")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--no-fresh-session", action="store_true")
+    p.add_argument("--strict", action="store_true")
+    p.add_argument("--answer-clicks", choices=["off", "on", "pre"])
+    args = p.parse_args()
+
+    if args.command == "list":
+        msg = ask(args.port, {"cmd": "list", "filter": args.filters, "tags": args.tag or []})
+        for t in msg["tests"]:
+            print(t["id"] + (f"  [{', '.join(t['tags'])}]" if t["tags"] else ""))
+        print(f"{len(msg['tests'])} tests", file=sys.stderr)
+        return 0
+    if args.command in ("state", "info"):
+        print(json.dumps(ask(args.port, {"cmd": args.command}), indent=1))
+        return 0
+    if args.command == "reload":
+        return 0 if reload(args, ask(args.port, {"cmd": "info"})) else 2
+    if args.command == "watch":
+        return watch(args, args.filters)
+    if args.command in ("run", "rerun") and args.reload and not reload(args, ask(args.port, {"cmd": "info"})):
+        return 2
+    if args.command == "run":
+        return run(args, args.filters)
+    if args.command == "rerun":
+        ids = [r["id"] for r in last() if not r["ok"] or not args.failed]
+        if not ids:
+            print("nothing to run again")
+            return 0
+        return run(args, ids)
+    if args.command == "report":
+        for r in last():
+            if not r["ok"] and r.get("report") and all(x in r["id"] for x in args.filters):
+                print(open(r["report"]).read())
+                return 0
+        print("no failed test with a report in the last run" + (f" matching {args.filters}" if args.filters else ""))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

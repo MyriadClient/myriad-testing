@@ -1,0 +1,20 @@
+{
+	"schemaVersion": 1,
+	"id": "myriad-testing",
+	"version": "${version}",
+	"name": "Myriad Testing",
+	"description": "In-game test runner for Myriad addons: runs the suites addons keep in their own repositories, driven from the myriad-test command line. For development only.",
+	"authors": ["Myriad"],
+	"license": "CC0-1.0",
+	"environment": "client",
+	"entrypoints": {
+		"myriad": ["dev.myriadclient.testing.TestingAddon"]
+	},
+	"custom": {
+		"myriad": {"updates": false}
+	},
+	"depends": {
+		"myriad": ">=${myriad_version}",
+		"minecraft": "~${minecraft_version}"
+	}
+}

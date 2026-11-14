@@ -1,0 +1,12 @@
+// The in-game test framework: a dev-only Myriad addon (never shipped to players) that runs the test suites addons keep
+// in their own repositories, and the driver the `myriad-test` command line talks to. Built by Myriad's addon plugin.
+plugins {
+	id 'dev.myriadclient.addon' version '2.0.0'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
