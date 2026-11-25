@@ -17,7 +17,7 @@ test whose id contains it ("scaffold", "tower").
 Options: --port N (the client's driver, 25610 by default), --rcon host:port, --rcon-password p, --server-log path
 (the test server's console log, for Grim's flags; defaults to Myriad's Grim test server next to this checkout),
 --dimension id (the worker's), --strict (the server runs current Grim as shipped: ./start.sh --strict), --json (raw
-result lines), --junit file.xml, --no-fresh-session, --answer-clicks off|on|pre (the server answers inventory clicks
+result lines), --junit file.xml, --no-fresh-session, --answer-clicks off|on|pre|slots (the server answers inventory clicks
 as 2b2t does; off by default), -v.
 
 Hot-swapping needs the client started with -Photswap (the JetBrains Runtime and a debug port), e.g.
@@ -432,7 +432,7 @@ def main():
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--no-fresh-session", action="store_true")
     p.add_argument("--strict", action="store_true")
-    p.add_argument("--answer-clicks", choices=["off", "on", "pre"])
+    p.add_argument("--answer-clicks", choices=["off", "on", "pre", "slots"])
     args = p.parse_args()
 
     if args.command == "list":

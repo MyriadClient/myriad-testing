@@ -28,7 +28,7 @@ public record Config(String rconHost, int rconPort, String rconPassword, @Nullab
 	/**
 	 * These, with whatever {@code json} sets: rcon ("host:port"), rconPassword, serverLog, dimension, arena [x, y, z],
 	 * freshSessionAfterFlags, strict, answerClicks ("off", "on": the server answers inventory clicks as 2b2t does,
-	 * "pre": harsher).
+	 * "pre": harsher, "slots": 2b2t's own one-slot answers).
 	 */
 	public Config with(@Nullable JsonObject json) {
 		if (json == null) return this;
